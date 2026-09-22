@@ -1,0 +1,81 @@
+# Render Blueprint for FluxGuard.
+#
+# Deliberately different shape from docker-compose.yml, not a straight port:
+#   - No Nginx here. Render's own edge already terminates TLS and routes
+#     traffic to your service - that's what nginx.conf did locally. Running
+#     Nginx again in front of Render's edge would just be a redundant hop.
+#   - No gateway1/gateway2 replica pair. Render's free web-service tier is a
+#     single instance; the multi-replica design is what core/limiter.py's
+#     Redis-backed atomicity is FOR (so it still matters, just isn't
+#     exercised at n=1 on the free tier).
+#   - "upstream" stays a `web` service (not `pserv`), because Render's free
+#     tier doesn't include private services. It's still only reached over
+#     Render's internal network via fromService below - its public URL is
+#     never shared or used by anything.
+#   - Redis is Render's own managed Key Value instance instead of a
+#     self-hosted container. Render generates and manages its credentials,
+#     which is a strict improvement over the REDIS_PASSWORD-in-.env setup
+#     used for local Docker Compose - one less secret for you to handle.
+#
+# Deploy: push this to your repo, then in the Render dashboard use
+# New -> Blueprint and point it at this file.
+
+services:
+  # -------------------------------------------------------------------- #
+  # Public gateway - what people actually hit
+  # -------------------------------------------------------------------- #
+  - type: web
+    name: fluxguard-gateway
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: >
+      gunicorn main:app
+      --workers 2
+      --worker-class uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 30
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: "8000"  # Tell Render which port this container actually listens on
+      - key: REDIS_URL
+        fromService:
+          name: fluxguard-redis
+          type: keyvalue
+          property: connectionString
+      - key: UPSTREAM_URL
+        fromService:
+          name: fluxguard-upstream
+          type: web
+          property: hostport  # internal host:port - never leaves Render's network
+      - key: METRICS_TOKEN
+        generateValue: true  # Render mints this; view it in the dashboard to query /metrics yourself
+
+  # -------------------------------------------------------------------- #
+  # Mock upstream - only reached internally by fluxguard-gateway above,
+  # never shared as a public link even though it technically has one
+  # (free tier requires `web`, not `pserv` - see note at top of file)
+  # -------------------------------------------------------------------- #
+  - type: web
+    name: fluxguard-upstream
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: uvicorn mock_upstream:app --host 0.0.0.0 --port 9000 --loop uvloop
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: "9000"
+
+# ---------------------------------------------------------------------- #
+# Managed Redis-compatible store (free tier: 25 MB, in-memory only - state
+# is lost on restart, which is fine for a rate-limiter demo)
+# ---------------------------------------------------------------------- #
+  - type: keyvalue
+    name: fluxguard-redis
+    plan: free
+    ipAllowList: []  # no external access - reachable only from services in this Blueprint
+    maxmemoryPolicy: allkeys-lru

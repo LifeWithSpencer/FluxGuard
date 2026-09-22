@@ -62,6 +62,13 @@ logger = structlog.get_logger("ratelimiter.gateway")
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "http://localhost:9000")
+if not UPSTREAM_URL.startswith(("http://", "https://")):
+    # Render's fromService `hostport` property returns bare "host:port" with
+    # no scheme (unlike docker-compose's UPSTREAM_URL=http://upstream:9000,
+    # which is a literal value we write ourselves). httpx.AsyncClient's
+    # base_url requires a scheme, so add one rather than requiring every
+    # deployment target to format this identically.
+    UPSTREAM_URL = f"http://{UPSTREAM_URL}"
 
 
 def _redact_redis_url(url: str) -> str:
@@ -168,8 +175,21 @@ async def readyz():
     return {"status": "ready", "circuit_state": app.state.engine.circuit_state.value}
 
 
+METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "")
+
+
 @app.get("/metrics")
-async def metrics_endpoint():
+async def metrics_endpoint(request: Request):
+    """Gated behind METRICS_TOKEN once this gateway is internet-facing.
+    Unauthenticated /metrics exposes internal traffic volume and
+    circuit-breaker state to anyone who can reach the service - fine on
+    localhost, not fine once there's a public URL. If METRICS_TOKEN isn't
+    set (e.g. running purely locally with no .env), this deliberately
+    falls back to open access rather than locking out local dev."""
+    if METRICS_TOKEN:
+        provided = request.headers.get("x-metrics-token", "")
+        if provided != METRICS_TOKEN:
+            return Response(status_code=404)  # 404, not 401 - don't confirm the endpoint exists
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
