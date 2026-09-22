@@ -8,10 +8,14 @@
 #     single instance; the multi-replica design is what core/limiter.py's
 #     Redis-backed atomicity is FOR (so it still matters, just isn't
 #     exercised at n=1 on the free tier).
-#   - "upstream" stays a `web` service (not `pserv`), because Render's free
-#     tier doesn't include private services. It's still only reached over
-#     Render's internal network via fromService below - its public URL is
-#     never shared or used by anything.
+#   - mock_upstream runs INSIDE the same container as the gateway, reached
+#     over localhost, rather than as its own Render service. Reason: Render
+#     free web services can send private-network requests but cannot
+#     RECEIVE them (https://render.com/docs/private-network) - so a separate
+#     free "upstream" service would have no internal hostname for the
+#     gateway to reach at all. Running it as its own service would need a
+#     paid Starter plan just for a demo backend that returns {"status":"ok"}.
+#     Colocating avoids that cost and the free-tier limitation entirely.
 #   - Redis is Render's own managed Key Value instance instead of a
 #     self-hosted container. Render generates and manages its credentials,
 #     which is a strict improvement over the REDIS_PASSWORD-in-.env setup
@@ -22,7 +26,8 @@
 
 services:
   # -------------------------------------------------------------------- #
-  # Public gateway - what people actually hit
+  # Public gateway - runs both the rate-limiting gateway AND the mock
+  # upstream it proxies to, as two processes in one free container
   # -------------------------------------------------------------------- #
   - type: web
     name: fluxguard-gateway
@@ -31,48 +36,27 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     dockerCommand: >
-      gunicorn main:app
-      --workers 2
-      --worker-class uvicorn.workers.UvicornWorker
-      --bind 0.0.0.0:8000
-      --timeout 30
+      sh -c "uvicorn mock_upstream:app --host 0.0.0.0 --port 9000 --loop uvloop &
+      exec gunicorn main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 30"
     healthCheckPath: /healthz
     envVars:
       - key: PORT
         value: "8000"  # Tell Render which port this container actually listens on
+      - key: UPSTREAM_URL
+        value: http://localhost:9000  # Same container now, not a separate service
       - key: REDIS_URL
         fromService:
           name: fluxguard-redis
           type: keyvalue
           property: connectionString
-      - key: UPSTREAM_URL
-        fromService:
-          name: fluxguard-upstream
-          type: web
-          property: hostport  # internal host:port - never leaves Render's network
       - key: METRICS_TOKEN
         generateValue: true  # Render mints this; view it in the dashboard to query /metrics yourself
 
-  # -------------------------------------------------------------------- #
-  # Mock upstream - only reached internally by fluxguard-gateway above,
-  # never shared as a public link even though it technically has one
-  # (free tier requires `web`, not `pserv` - see note at top of file)
-  # -------------------------------------------------------------------- #
-  - type: web
-    name: fluxguard-upstream
-    runtime: docker
-    plan: free
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    dockerCommand: uvicorn mock_upstream:app --host 0.0.0.0 --port 9000 --loop uvloop
-    healthCheckPath: /
-    envVars:
-      - key: PORT
-        value: "9000"
-
 # ---------------------------------------------------------------------- #
 # Managed Redis-compatible store (free tier: 25 MB, in-memory only - state
-# is lost on restart, which is fine for a rate-limiter demo)
+# is lost on restart, which is fine for a rate-limiter demo). Key Value
+# instances have their own dedicated internal connection URL regardless of
+# the free-web-service receive limitation above, so this works as-is.
 # ---------------------------------------------------------------------- #
   - type: keyvalue
     name: fluxguard-redis
