@@ -108,3 +108,25 @@ class TestForwardedForTrust:
         caller_id_2, _ = identify_caller(req2)
 
         assert caller_id_1 == caller_id_2 == real_client_ip
+
+
+class TestCloudflareConnectingIP:
+    def test_cf_connecting_ip_preferred_over_xff(self):
+        """Render deployments sit behind Cloudflare. CF-Connecting-IP is set
+        directly by Cloudflare's edge (not appended to, unlike XFF), so it
+        should win when present - added after observing inconsistent
+        identity resolution in production that XFF's multi-hop ordering
+        couldn't reliably account for on that specific platform."""
+        req = _make_request({
+            "cf-connecting-ip": "203.0.113.99",
+            "x-forwarded-for": "1.2.3.4, 203.0.113.99",
+        })
+        caller_id, method = identify_caller(req)
+        assert (caller_id, method) == ("203.0.113.99", "ip")
+
+    def test_falls_back_to_xff_when_no_cf_header(self):
+        """Local Docker Compose (no Cloudflare in front) has no
+        CF-Connecting-IP at all - must still fall back to the XFF logic."""
+        req = _make_request({"x-forwarded-for": "198.51.100.7"})
+        caller_id, method = identify_caller(req)
+        assert (caller_id, method) == ("198.51.100.7", "ip")

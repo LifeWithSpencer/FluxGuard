@@ -43,8 +43,19 @@ def identify_caller(request: Request) -> tuple[str, str]:
 
     Priority: X-API-Key header > Authorization: Bearer token > client IP.
 
-    Trust assumption: the IP fallback only works correctly if this gateway
-    sits behind a trusted reverse proxy (see nginx.conf) that OVERWRITES
+    For the IP fallback: CF-Connecting-IP is checked first when present.
+    Render (this gateway's cloud deployment target) sits behind Cloudflare,
+    and Render's own users have documented X-Forwarded-For there sometimes
+    containing a Render-internal IP rather than reliably ending with the
+    true client IP once multiple internal hops are involved
+    (https://feedback.render.com/features/p/send-the-correct-xforwardedfor).
+    CF-Connecting-IP doesn't have that problem: Cloudflare's edge sets it
+    directly and it is never appended to or forwarded further, so there's
+    no multi-hop ordering ambiguity to get wrong.
+
+    X-Forwarded-For remains the fallback for deployments with no Cloudflare
+    in front (e.g. local Docker Compose behind this repo's own Nginx). Trust
+    assumption there: the reverse proxy (see nginx.conf) OVERWRITES
     X-Forwarded-For with the real peer address rather than appending to it.
     If a proxy instead appends (e.g. via Nginx's default
     $proxy_add_x_forwarded_for), a client can prepend an arbitrary value and
@@ -65,6 +76,10 @@ def identify_caller(request: Request) -> tuple[str, str]:
         token = auth.split(" ", 1)[1].strip()
         if token:
             return token, "bearer_token"
+
+    cf_connecting_ip = request.headers.get("cf-connecting-ip")
+    if cf_connecting_ip:
+        return cf_connecting_ip.strip(), "ip"
 
     client_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for")
